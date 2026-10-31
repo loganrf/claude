@@ -1,0 +1,26 @@
+// Use the Claude Code sandbox image as a dev container for any project.
+// Copy this file to .devcontainer/devcontainer.json in your repository.
+{
+  "name": "Claude Code sandbox",
+  "image": "ghcr.io/loganrf/claude:latest",
+  // Keep the image's entrypoint: it prepares the sandbox user and, once you have
+  // signed in (run `claude auth login` in the container terminal, then rebuild),
+  // serves this workspace to claude.ai/code and the Claude app.
+  "overrideCommand": false,
+  "remoteUser": "claude",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+  "workspaceFolder": "/workspace",
+  "mounts": [
+    "source=claude-code-config,target=/home/claude/.claude,type=volume"
+  ],
+  "containerEnv": {
+    "ANTHROPIC_API_KEY": "${localEnv:ANTHROPIC_API_KEY}",
+    "CLAUDE_CODE_OAUTH_TOKEN": "${localEnv:CLAUDE_CODE_OAUTH_TOKEN}",
+    "GH_TOKEN": "${localEnv:GH_TOKEN}"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": ["anthropic.claude-code"]
+    }
+  }
+}

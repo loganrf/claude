@@ -1,0 +1,149 @@
+name: Image
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+    paths-ignore: ["**/*.md", ".env.example", "examples/**"]
+  pull_request:
+    paths-ignore: ["**/*.md", ".env.example", "examples/**"]
+  schedule:
+    # Weekly rebuild: new Claude Code release plus Debian and Node.js fixes.
+    - cron: "23 7 * * 1"
+  workflow_dispatch:
+    inputs:
+      claude_code_version:
+        description: Claude Code version or channel (stable, latest, or a version like 2.1.309)
+        required: false
+        default: stable
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Lint shell scripts
+        run: shellcheck docker/*.sh tests/*.sh
+
+      - name: Resolve Claude Code version
+        id: claude
+        env:
+          REQUESTED: ${{ inputs.claude_code_version || 'stable' }}
+        run: |
+          version="$REQUESTED"
+          if [[ $version == stable || $version == latest ]]; then
+            version="$(curl -fsSL "https://downloads.claude.ai/claude-code-releases/$version")"
+          fi
+          if [[ ! $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::unexpected Claude Code version '$version'"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Claude Code \`$version\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Decide whether to publish
+        id: target
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          publish=false
+          if [[ $EVENT != pull_request && ( $REF == "refs/heads/$DEFAULT_BRANCH" || $REF == refs/tags/v* ) ]]; then
+            publish=true
+          fi
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.target.outputs.image }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=claude-code-${{ steps.claude.outputs.version }},enable={{is_default_branch}}
+            type=sha,prefix=sha-,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=pr
+          labels: |
+            org.opencontainers.image.title=Claude Code sandbox
+            io.github.claude-sandbox.claude-code-version=${{ steps.claude.outputs.version }}
+
+      - name: Build for testing (linux/amd64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: claude-sandbox:test
+          build-args: CLAUDE_CODE_VERSION=${{ steps.claude.outputs.version }}
+          # Scheduled builds start clean so OS packages are refreshed.
+          no-cache: ${{ github.event_name == 'schedule' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test
+        run: tests/smoke.sh claude-sandbox:test "${{ steps.claude.outputs.version }}"
+
+      - name: Log in to GitHub Container Registry
+        if: steps.target.outputs.publish == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build linux/amd64 + linux/arm64${{ steps.target.outputs.publish == 'true' && ' and push' || '' }}
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ steps.target.outputs.publish == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          build-args: CLAUDE_CODE_VERSION=${{ steps.claude.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+
+      - name: Attest build provenance
+        if: steps.target.outputs.publish == 'true'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ steps.target.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Summary
+        if: steps.target.outputs.publish == 'true'
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          {
+            echo "### Published"
+            echo '```'
+            echo "$TAGS"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

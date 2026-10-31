@@ -1,0 +1,4 @@
+# Local credentials and state used by compose.yaml / compose.runner.yaml
+.env
+environment-secret
+workspace/

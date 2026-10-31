@@ -1,0 +1,36 @@
+# Claude Code sandbox as an always-on service you can reach from
+# https://claude.ai/code and the Claude app (Remote Control).
+#
+#   cp .env.example .env                    # optional: tokens, git identity, repo to clone
+#   docker compose run --rm claude login    # once: sign in with your Claude plan
+#   docker compose up -d
+#
+# Open Claude Code in the terminal at any time:
+#   docker compose exec claude claude
+#
+# For a Team/Enterprise self-hosted environment use compose.runner.yaml instead.
+name: claude-sandbox
+
+services:
+  claude:
+    image: ${CLAUDE_SANDBOX_IMAGE:-ghcr.io/loganrf/claude:latest}
+    command: ["server"]
+    # Default Remote Control session names start with the hostname.
+    hostname: ${CLAUDE_SANDBOX_HOSTNAME:-claude-sandbox}
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      # Claude Code login, settings and history. Keep it: it holds your login.
+      - claude-config:/home/claude/.claude
+      # The project Claude works on. Point WORKSPACE at an existing checkout,
+      # or leave it and set GIT_REPO_URL to clone into it on first start.
+      - ${WORKSPACE:-./workspace}:/workspace
+    # A TTY lets you `docker attach claude-sandbox-claude-1` to see the
+    # Remote Control status screen and QR code (detach with Ctrl-P Ctrl-Q).
+    tty: true
+    stdin_open: true
+    restart: unless-stopped
+
+volumes:
+  claude-config:

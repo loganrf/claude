@@ -1,0 +1,46 @@
+# Claude Code sandbox as a self-hosted environment runner (Claude Team and
+# Enterprise). Sessions started at https://claude.ai/code, in the Claude apps or
+# with `claude --cloud` run in this container when you pick its environment.
+#
+# 1. An Owner turns on "Allow self-hosted environments" and creates an
+#    environment at https://claude.ai/admin-settings/cloud-environments.
+# 2. Save the environment key it shows once:
+#      (umask 077 && cat > environment-secret)   # paste, Enter, Ctrl-D
+# 3. docker compose -f compose.runner.yaml up -d
+#
+# The runner exits after each session by design and Compose restarts it. A
+# restart reuses the container's filesystem, which is fine for evaluation; for
+# production run a fresh container per session (see README.md).
+name: claude-sandbox-runner
+
+services:
+  runner:
+    image: ${CLAUDE_SANDBOX_IMAGE:-ghcr.io/loganrf/claude:latest}
+    command: ["runner"]
+    environment:
+      SELF_HOSTED_RUNNER_ENVIRONMENT_SECRET_FILE: /run/secrets/environment-secret
+      # Optional: GH_TOKEN for git and gh in sessions. Without one, the runner
+      # uses the Anthropic git proxy for github.com repositories.
+      GH_TOKEN: ${GH_TOKEN:-}
+      CLAUDE_RUNNER_CAPACITY: ${CLAUDE_RUNNER_CAPACITY:-1}
+    secrets:
+      - environment-secret
+    volumes:
+      # Kept separate from your personal login on purpose: the runner copies
+      # this directory into every session it runs.
+      - runner-config:/home/claude/.claude
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+    # Default drain budget is 80s; give it room before Docker sends SIGKILL.
+    stop_grace_period: 90s
+    restart: always
+
+secrets:
+  environment-secret:
+    file: ${RUNNER_SECRET_FILE:-./environment-secret}
+
+volumes:
+  runner-config:

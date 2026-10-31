@@ -1,0 +1,6 @@
+ignored:
+  # Unpinned apt packages are deliberate: weekly rebuilds pick up Debian security fixes.
+  - DL3008
+  # Every stage sets SHELL to bash; hadolint still lints RUN lines as POSIX sh.
+  - SC3010
+  - SC3015
