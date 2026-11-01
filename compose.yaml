@@ -1,9 +1,16 @@
 # Claude Code sandbox as an always-on service you can reach from
-# https://claude.ai/code and the Claude app (Remote Control).
+# https://claude.ai/code and the Claude app (Remote Control), with a web UI to
+# set it up.
 #
-#   cp .env.example .env                    # optional: tokens, git identity, repo to clone
-#   docker compose run --rm claude login    # once: sign in with your Claude plan
+#   cp .env.example .env              # optional: web UI password, tokens, git identity, repo to clone
+#   mkdir -p workspace
 #   docker compose up -d
+#   docker compose logs claude        # the setup code for your first visit
+#
+# Then open http://localhost:8765 (or this machine's address): create a
+# password, sign in to Claude and add a GitHub token. Remote Control starts as
+# soon as you're signed in. Prefer the terminal for signing in?
+#   docker compose run --rm claude login
 #
 # Open Claude Code in the terminal at any time:
 #   docker compose exec claude claude
@@ -20,16 +27,23 @@ services:
     env_file:
       - path: .env
         required: false
+    ports:
+      # Web UI. CLAUDE_SANDBOX_WEBUI_PORT=127.0.0.1:8765 in .env accepts
+      # connections from this machine only.
+      - "${CLAUDE_SANDBOX_WEBUI_PORT:-8765}:8765"
     volumes:
-      # Claude Code login, settings and history. Keep it: it holds your login.
+      # Claude Code login, settings and history, and what you save in the web
+      # UI. Keep it: it holds your login.
       - claude-config:/home/claude/.claude
       # The project Claude works on. Point WORKSPACE at an existing checkout,
       # or leave it and set GIT_REPO_URL to clone into it on first start.
       - ${WORKSPACE:-./workspace}:/workspace
-    # A TTY lets you `docker attach claude-sandbox-claude-1` to see the
-    # Remote Control status screen and QR code (detach with Ctrl-P Ctrl-Q).
+    # A TTY lets you `docker attach claude-sandbox-claude-1` to watch the
+    # Remote Control status screen (detach with Ctrl-P Ctrl-Q).
     tty: true
     stdin_open: true
+    # Time for Remote Control to close its sessions on `docker compose down`.
+    stop_grace_period: 30s
     restart: unless-stopped
 
 volumes:

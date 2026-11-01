@@ -7,12 +7,15 @@
 #                   `interactive` when a TTY is attached, otherwise `server`
 #   interactive     Claude Code in the terminal; also reachable from claude.ai/code
 #                   and the Claude app via Remote Control when a claude.ai login exists
-#   server          background service: self-hosted runner > Remote Control server > idle
+#   server          background service: self-hosted runner > web UI, which runs
+#                   Remote Control when it can > (CLAUDE_WEBUI=0) Remote Control > idle
+#   webui           the web UI on port CLAUDE_WEBUI_PORT (default 8765)
 #   remote-control  `claude remote-control` server (needs a claude.ai login)
 #   runner          `claude self-hosted-runner` (Team/Enterprise environment secret)
 #   login           one-time `claude auth login`, stored in the config volume
 #   setup-token     print a long-lived CLAUDE_CODE_OAUTH_TOKEN for use elsewhere
-#   status          show what the container detected and would run
+#   status          show what the container detected and would run (--json for JSON)
+#   prepare         apply settings (git identity and credentials, GIT_REPO_URL) and exit
 #   shell           bash login shell as the sandbox user
 #   idle            stay up so you can `docker exec` in
 #   help            this text
@@ -24,9 +27,13 @@ set -Eeuo pipefail
 
 readonly SANDBOX_USER=claude
 readonly REAL_CLAUDE=/usr/local/lib/claude-code/claude
+readonly SANDBOX_LIB="${CLAUDE_SANDBOX_LIB:-/usr/local/lib/claude-sandbox}"
 
 WORKDIR="${CLAUDE_WORKDIR:-/workspace}"
 export CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-/home/${SANDBOX_USER}/.claude}"
+
+# shellcheck source=docker/settings.sh
+. "$SANDBOX_LIB/settings.sh"
 
 log()  { printf '[claude-sandbox] %s\n' "$*" >&2; }
 warn() { printf '[claude-sandbox] WARNING: %s\n' "$*" >&2; }
@@ -38,6 +45,8 @@ is_true() {
     *) return 1 ;;
   esac
 }
+
+json_bool() { if "$@"; then echo true; else echo false; fi; }
 
 usage() { sed -n '2,/^set -Eeuo/{/^set -Eeuo/d;/shellcheck/d;s/^# \{0,1\}//;p;}' "$0"; }
 
@@ -53,6 +62,7 @@ readonly SECRET_VARS=(
   ANTHROPIC_API_KEY
   ANTHROPIC_AUTH_TOKEN
   CLAUDE_CODE_OAUTH_TOKEN
+  CLAUDE_WEBUI_PASSWORD
   GH_TOKEN
   GITHUB_TOKEN
   SELF_HOSTED_RUNNER_ENVIRONMENT_SECRET
@@ -158,7 +168,67 @@ root_phase() {
     rm -f /etc/sudoers.d/claude-sandbox
   fi
 
+  start_docker "${1:-${CLAUDE_MODE:-auto}}"
   run_as_sandbox_user "$0" "$@"
+}
+
+# ---------------------------------------------------------------------------
+# Docker inside the sandbox: CLAUDE_DOCKER=1 in a privileged container (see
+# compose.docker.yaml). dockerd runs as root; the claude user reaches it through
+# the docker group. Containers it runs stop when the sandbox stops.
+# ---------------------------------------------------------------------------
+start_docker() {
+  local mode="$1" log=/var/log/dockerd.log capeff pid _
+  is_true "${CLAUDE_DOCKER:-0}" || return 0
+  case "$mode" in
+    login | setup-token | status | prepare | version | help | --help | -h) return 0 ;; # one-off commands
+  esac
+  if docker info >/dev/null 2>&1; then
+    log "CLAUDE_DOCKER: using the Docker daemon that's already reachable"
+    return 0
+  fi
+  if ! command -v dockerd >/dev/null 2>&1; then
+    warn "CLAUDE_DOCKER is set, but this image has no dockerd"
+    return 0
+  fi
+  capeff="$(awk '/^CapEff:/ { print $2 }' /proc/self/status)"
+  if (((16#$capeff >> 21 & 1) == 0)); then # no CAP_SYS_ADMIN: not privileged
+    warn "CLAUDE_DOCKER needs a privileged container (privileged: true, as in compose.docker.yaml); not starting Docker"
+    return 0
+  fi
+  # What Docker's own dind script does: cgroup v2 nesting, AppArmor detection
+  # and shared mount propagation.
+  if [[ -f /sys/fs/cgroup/cgroup.controllers ]]; then
+    mkdir -p /sys/fs/cgroup/init
+    xargs -rn1 </sys/fs/cgroup/cgroup.procs >/sys/fs/cgroup/init/cgroup.procs 2>/dev/null || true
+    sed -e 's/ / +/g' -e 's/^/+/' </sys/fs/cgroup/cgroup.controllers >/sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
+  fi
+  if [[ -d /sys/kernel/security ]] && ! mountpoint -q /sys/kernel/security; then
+    mount -t securityfs none /sys/kernel/security 2>/dev/null || true
+  fi
+  mount --make-rshared / 2>/dev/null || true
+  # A restarted container still has the previous run's pid file and socket.
+  rm -rf /var/run/docker.pid /var/run/docker.sock /var/run/docker
+  log "CLAUDE_DOCKER: starting Docker (log in $log)"
+  container=docker dockerd --group docker >"$log" 2>&1 &
+  pid=$!
+  for _ in $(seq 1 60); do
+    if docker info >/dev/null 2>&1; then
+      log "Docker $(docker info --format '{{.ServerVersion}}' 2>/dev/null) is running; the $SANDBOX_USER user can use it"
+      return 0
+    fi
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.5
+  done
+  warn "Docker didn't start; the end of $log:"
+  tail -n 15 "$log" | sed 's/^/  /' >&2
+}
+
+docker_version() { # server version of a reachable Docker daemon, or nothing
+  local v
+  v="$(timeout 3 docker info --format '{{.ServerVersion}}' 2>/dev/null || true)"
+  [[ $v =~ ^[0-9][0-9A-Za-z.+~-]*$ ]] && printf '%s\n' "$v"
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -267,12 +337,15 @@ auth_method() { # how Claude Code would authenticate with the current environmen
   jq -r '.authMethod // "none"' <<<"$out" 2>/dev/null || printf 'unknown\n'
 }
 
-has_claudeai_login() { # a full-scope `claude auth login` stored in the config dir
+stored_login_status() { # `claude auth status --json` for the login stored in the config dir
   local out
   out="$(env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u CLAUDE_CODE_OAUTH_TOKEN \
     "$REAL_CLAUDE" auth status --json 2>/dev/null || true)"
-  [[ -n $out ]] || out='{}'
-  [[ $(jq -r '.authMethod // "none"' <<<"$out" 2>/dev/null) == claude.ai ]]
+  jq -ce 'objects' <<<"$out" 2>/dev/null || printf '{}\n'
+}
+
+has_claudeai_login() { # a full-scope `claude auth login` stored in the config dir
+  [[ $(stored_login_status | jq -r '.authMethod // "none"') == claude.ai ]]
 }
 
 has_runner_secret() { [[ -n ${SELF_HOSTED_RUNNER_ENVIRONMENT_SECRET:-} ]]; }
@@ -430,9 +503,25 @@ mode_idle() {
   run sleep infinity
 }
 
+mode_webui() {
+  local server="$SANDBOX_LIB/webui/server.mjs" node=/usr/local/bin/node
+  [[ -r $server ]] || die "the web UI is not installed in this image ($server)"
+  [[ -x $node ]] || node=node
+  # The web UI reads the saved settings itself, and the Remote Control it starts
+  # loads them again, so hand it the container's own environment.
+  local env_args=() v
+  for v in "${CLAUDE_SANDBOX_SETTINGS_LOADED[@]}"; do env_args+=(-u "$v"); done
+  if [[ -n $WEBUI_PASSWORD ]]; then export CLAUDE_WEBUI_PASSWORD="$WEBUI_PASSWORD"; fi
+  cd "$WORKDIR"
+  run env "${env_args[@]}" "$node" "$server" "$@"
+}
+
 mode_server() {
   if has_runner_secret; then
     mode_runner "$@"
+  fi
+  if is_true "${CLAUDE_WEBUI:-1}"; then
+    mode_webui "$@"
   fi
   local blockers
   blockers="$(remote_control_blockers)"
@@ -443,7 +532,8 @@ mode_server() {
 }
 
 mode_login() {
-  [[ -t 0 && -t 1 ]] || die "login needs an interactive terminal: docker compose run --rm claude login (or docker run -it ... login)"
+  # A pipe or socket is fine too: the web UI drives this command and passes the code in.
+  [[ -t 0 || -p /dev/stdin || -S /dev/stdin ]] || die "login needs an interactive terminal: docker compose run --rm claude login (or docker run -it ... login)"
   log "signing in to claude.ai; the login is saved in $CLAUDE_CONFIG_DIR (keep it on a volume)"
   log "if no browser opens, open the URL shown below on any device and paste the code back here"
   env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u CLAUDE_CODE_OAUTH_TOKEN \
@@ -455,16 +545,75 @@ mode_login() {
   fi
 }
 
+status_json() {
+  local method="$1" mode="$2" login rc_blockers git_json='{"repo": false}'
+  login="$(stored_login_status)"
+  # Reasons Remote Control couldn't start even if it were turned on.
+  rc_blockers="$(CLAUDE_REMOTE_CONTROL=1 remote_control_blockers)"
+  if git -C "$WORKDIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git_json="$(jq -n \
+      --arg branch "$(git -C "$WORKDIR" branch --show-current 2>/dev/null || true)" \
+      --arg remote "$(git -C "$WORKDIR" remote get-url origin 2>/dev/null | sed -E 's#://[^/@]+@#://#' || true)" \
+      --arg commit "$(git -C "$WORKDIR" log -1 --format='%h %s' 2>/dev/null || true)" \
+      '{repo: true, branch: $branch, remote: $remote, commit: $commit}')"
+  fi
+  jq -n \
+    --arg claudeCode "$("$REAL_CLAUDE" --version 2>/dev/null || echo unknown)" \
+    --arg user "$(id -un)" --argjson uid "$(id -u)" --argjson gid "$(id -g)" \
+    --arg hostname "${HOSTNAME:-}" --arg workspace "$WORKDIR" --arg configDir "$CLAUDE_CONFIG_DIR" \
+    --arg authMethod "$method" --argjson login "$login" \
+    --argjson apiKey "$(json_bool test -n "${ANTHROPIC_API_KEY:-}")" \
+    --argjson authToken "$(json_bool test -n "${ANTHROPIC_AUTH_TOKEN:-}")" \
+    --argjson oauthToken "$(json_bool test -n "${CLAUDE_CODE_OAUTH_TOKEN:-}")" \
+    --argjson githubToken "$(json_bool test -n "${GH_TOKEN:-}${GITHUB_TOKEN:-}")" \
+    --argjson runnerSecret "$(json_bool has_runner_secret)" \
+    --argjson sudo "$(json_bool test -e /etc/sudoers.d/claude-sandbox)" \
+    --argjson trustWorkspace "$(json_bool is_true "${CLAUDE_TRUST_WORKSPACE:-1}")" \
+    --arg permissionMode "${CLAUDE_PERMISSION_MODE:-}" \
+    --argjson rcEnabled "$(json_bool is_true "${CLAUDE_REMOTE_CONTROL:-1}")" \
+    --arg rcBlockers "$rc_blockers" \
+    --arg rcName "${CLAUDE_RC_NAME:-}" --arg rcSpawn "${CLAUDE_RC_SPAWN:-same-dir}" --arg rcCapacity "${CLAUDE_RC_CAPACITY:-}" \
+    --arg gitName "$(git config --global user.name 2>/dev/null || true)" \
+    --arg gitEmail "$(git config --global user.email 2>/dev/null || true)" \
+    --argjson dockerEnabled "$(json_bool is_true "${CLAUDE_DOCKER:-0}")" --arg dockerVersion "$(docker_version)" \
+    --argjson git "$git_json" --arg serverMode "$mode" \
+    '{
+      claudeCode: $claudeCode, user: $user, uid: $uid, gid: $gid, hostname: $hostname,
+      workspace: $workspace, configDir: $configDir,
+      authMethod: $authMethod,
+      claudeaiLogin: ($login.authMethod == "claude.ai"),
+      account: (if $login.authMethod == "claude.ai" then ($login | {email, orgName, subscriptionType}) else null end),
+      apiKey: $apiKey, authToken: $authToken, oauthToken: $oauthToken, githubToken: $githubToken,
+      runnerSecret: $runnerSecret, sudo: $sudo, trustWorkspace: $trustWorkspace,
+      permissionMode: (if $permissionMode == "" then null else $permissionMode end),
+      remoteControl: {
+        enabled: $rcEnabled,
+        blockers: ($rcBlockers | split("\n") | map(select(length > 0))),
+        name: $rcName, spawn: $rcSpawn, capacity: $rcCapacity
+      },
+      gitIdentity: {name: $gitName, email: $gitEmail},
+      git: $git,
+      docker: {enabled: $dockerEnabled, version: (if $dockerVersion == "" then null else $dockerVersion end)},
+      serverMode: $serverMode
+    }'
+}
+
 mode_status() {
   local method blockers mode
   method="$(auth_method)"
   blockers="$(remote_control_blockers)"
   if has_runner_secret; then
     mode="runner"
+  elif is_true "${CLAUDE_WEBUI:-1}"; then
+    mode="webui"
   elif [[ -z $blockers ]]; then
     mode="remote-control"
   else
     mode="idle"
+  fi
+  if [[ ${1:-} == --json ]]; then
+    status_json "$method" "$mode"
+    return
   fi
   printf 'Claude Code     %s\n' "$("$REAL_CLAUDE" --version 2>/dev/null || echo unknown)"
   printf 'User            %s (uid %s, gid %s)\n' "$(id -un)" "$(id -u)" "$(id -g)"
@@ -480,6 +629,20 @@ mode_status() {
     printf 'Remote Control  unavailable\n'
     sed 's/^/                - /' <<<"$blockers"
   fi
+  if is_true "${CLAUDE_WEBUI:-1}"; then
+    printf 'Web UI          on, port %s (server mode)\n' "${CLAUDE_WEBUI_PORT:-8765}"
+  else
+    printf 'Web UI          off (CLAUDE_WEBUI)\n'
+  fi
+  local docker
+  docker="$(docker_version)"
+  if [[ -n $docker ]]; then
+    printf 'Docker          %s\n' "$docker"
+  elif is_true "${CLAUDE_DOCKER:-0}"; then
+    printf 'Docker          not running (CLAUDE_DOCKER is set; see /var/log/dockerd.log)\n'
+  else
+    printf 'Docker          off (CLAUDE_DOCKER)\n'
+  fi
   printf 'Server mode     %s\n' "$mode"
 }
 
@@ -489,6 +652,12 @@ main() {
     root_phase "$@"
   fi
 
+  # Only the web UI needs its password; keep it out of every other environment.
+  WEBUI_PASSWORD="${CLAUDE_WEBUI_PASSWORD:-}"
+  unset CLAUDE_WEBUI_PASSWORD
+  # As the sandbox user only: the settings file is writable by that user.
+  claude_sandbox_load_settings
+
   local mode="${1:-${CLAUDE_MODE:-auto}}"
   if [[ $mode == -* ]]; then
     mode=interactive # `docker run -it <image> --model opus`
@@ -496,14 +665,17 @@ main() {
     (($# == 0)) || shift
   fi
 
-  case "$mode" in
-    help | --help | -h) usage; exit 0 ;;
-  esac
-
   case ":$PATH:" in
     *":$HOME/.local/bin:"*) ;;
     *) export PATH="$HOME/.local/bin:$PATH" ;;
   esac
+
+  # Read-only modes: no config seeding, git setup or clone.
+  case "$mode" in
+    help | --help | -h) usage; exit 0 ;;
+    status) mode_status "$@"; exit 0 ;;
+  esac
+
   mkdir -p "$CLAUDE_CONFIG_DIR" "$WORKDIR"
   chmod 700 "$CLAUDE_CONFIG_DIR" 2>/dev/null || true
   seed_config
@@ -527,7 +699,8 @@ main() {
     runner) mode_runner "$@" ;;
     login) mode_login "$@" ;;
     setup-token) run "$REAL_CLAUDE" setup-token "$@" ;;
-    status) mode_status ;;
+    webui) mode_webui "$@" ;;
+    prepare) exit 0 ;;
     shell) cd "$WORKDIR" && run bash "$@" ;;
     idle) mode_idle "" ;;
     version) run "$REAL_CLAUDE" --version ;;
