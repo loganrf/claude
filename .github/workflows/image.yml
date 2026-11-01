@@ -39,6 +39,9 @@ jobs:
       - name: Lint shell scripts
         run: shellcheck docker/*.sh tests/*.sh
 
+      - name: Check web UI syntax
+        run: node --check docker/webui/server.mjs && node --check docker/webui/public/app.js
+
       - name: Resolve Claude Code version
         id: claude
         env:

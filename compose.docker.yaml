@@ -1,0 +1,24 @@
+# Opt-in: Docker inside the sandbox (Docker-in-Docker), so Claude can build
+# images and run containers, including this repository's smoke tests. Use it
+# together with compose.yaml:
+#
+#   docker compose -f compose.yaml -f compose.docker.yaml up -d
+#
+# or put COMPOSE_FILE=compose.yaml:compose.docker.yaml in .env so every
+# `docker compose` command includes it.
+#
+# This runs the sandbox as a privileged container. Code inside it, including
+# anything Claude runs, can then take over the Docker host. Only use it on a
+# host you're willing to hand to Claude. See README.md, "Docker inside the sandbox".
+services:
+  claude:
+    privileged: true
+    environment:
+      CLAUDE_DOCKER: "1"
+    volumes:
+      # Images, containers and build cache of the inner Docker. It has to be a
+      # volume: Docker can't keep its layers on the container's own filesystem.
+      - docker-data:/var/lib/docker
+
+volumes:
+  docker-data:
