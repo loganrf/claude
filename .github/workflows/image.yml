@@ -130,7 +130,7 @@ jobs:
 
       - name: Attest build provenance
         if: steps.target.outputs.publish == 'true'
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-name: ${{ steps.target.outputs.image }}
           subject-digest: ${{ steps.build.outputs.digest }}
