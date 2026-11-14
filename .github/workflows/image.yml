@@ -106,7 +106,7 @@ jobs:
 
       - name: Log in to GitHub Container Registry
         if: steps.target.outputs.publish == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
